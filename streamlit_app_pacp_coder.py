@@ -179,7 +179,7 @@ def process_files(conditions_xl, inspections_xl, ratings_xl, unwanted_codes: set
 
 # =================== STREAMLIT UI ===================
 
-st.title("PACP Coder 2.0 — streamlit (normalized codes)")
+st.title("PACP Coder 2.0 — streamlit")
 
 c1, c2, c3 = st.columns(3)
 with c1:
