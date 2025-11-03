@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import re
 
-# ===== default unwanted codes (same as your script) =====
+# ===== default unwanted codes (same as your earlier version) =====
 DEFAULT_UNWANTED_STR = (
     "ACB, ACOM, AEP, AMH, AOC, ATC, MGO, MMC, MSC, MWL, MWM, "
     "TB, TBA, TBC, TBD, TF, TFA, TFC, TFD, TS, TSA"
@@ -19,16 +19,21 @@ def parse_unwanted(text: str) -> set:
 
 def process_codes(df: pd.DataFrame, unwanted_codes: set):
     """
-    Exact shape of your original logic: drop unwanted, detect S/F pairs,
-    count continuous, and emit one entry per code.
+    Build the code list for ONE inspection/segment:
+      - drop unwanted
+      - detect S/F continuous pairs
+      - for non-continuous counts, DO NOT include those S/F rows
     """
+    # keep only wanted codes
     df_filtered = df[~df['PACP_Code'].isin(unwanted_codes) & df['PACP_Code'].notna()]
     if df_filtered.empty:
         return []
 
-    so_lookup, fo_lookup, used_indices, continuous_counts = {}, {}, set(), {}
+    so_lookup, fo_lookup = {}, {}
+    used_indices = set()
+    continuous_counts = {}
 
-    # build S/F lookups
+    # 1) build lookups for S and F
     for idx, row in df_filtered.iterrows():
         code = str(row['PACP_Code']).strip()
         cont = str(row.get('Continuous', '')).strip().upper()
@@ -37,41 +42,45 @@ def process_codes(df: pd.DataFrame, unwanted_codes: set):
         elif cont.startswith('F'):
             fo_lookup[(code, cont[1:])] = idx
 
-    # match Sxx/Fxx
+    # 2) match S/F pairs → mark them used
     for (code, num), s_idx in so_lookup.items():
         if (code, num) in fo_lookup:
             f_idx = fo_lookup[(code, num)]
             continuous_counts[code] = continuous_counts.get(code, 0) + 1
             used_indices.update([s_idx, f_idx])
 
+    # 3) rows that are NOT in S/F pairs = real non-continuous rows
+    df_noncont = df_filtered[~df_filtered.index.isin(used_indices)]
+
     final = []
-    seen_normal = set()
     seen_cont = set()
+    seen_noncont = set()
 
     for idx, row in df_filtered.iterrows():
         code = str(row['PACP_Code']).strip()
+
         if idx in used_indices:
             # part of a continuous pair
             if code not in seen_cont:
-                cnt = continuous_counts.get(code, 1)
-                final.append(f"{code} ©" if cnt == 1 else f"{code} ©X{cnt}")
+                pair_count = continuous_counts.get(code, 1)
+                final.append(f"{code} ©" if pair_count == 1 else f"{code} ©X{pair_count}")
                 seen_cont.add(code)
         else:
-            # non-continuous
-            if code not in seen_normal:
-                cnt = (df_filtered['PACP_Code'] == code).sum()
-                final.append(f"{code} X{cnt}" if cnt > 1 else code)
-                seen_normal.add(code)
+            # NOT part of S/F → count ONLY among noncontinuous rows
+            if code not in seen_noncont:
+                noncont_count = (df_noncont['PACP_Code'] == code).sum()
+                final.append(f"{code} X{noncont_count}" if noncont_count > 1 else code)
+                seen_noncont.add(code)
 
     return final
 
 def process_files(conditions_xl, inspections_xl, ratings_xl, unwanted_codes: set) -> pd.DataFrame:
-    # read Excel
+    # read
     df_conditions = pd.read_excel(conditions_xl)
     df_inspections = pd.read_excel(inspections_xl)
     df_ratings = pd.read_excel(ratings_xl)
 
-    # merge inspections first (include date, street, city etc.)
+    # merge inspections (to get PSR + meta)
     df_merged = df_conditions.merge(
         df_inspections[
             [
@@ -105,37 +114,29 @@ def process_files(conditions_xl, inspections_xl, ratings_xl, unwanted_codes: set
         how="left",
     )
 
-    rows = []
-    # group like your script
-    for (insp_id, seg_ref), group in df_merged.groupby(
-        ["InspectionID", "Pipe_Segment_Reference"]
-    ):
+    out_rows = []
+    for (insp_id, psr), group in df_merged.groupby(["InspectionID", "Pipe_Segment_Reference"]):
         codes = process_codes(group, unwanted_codes)
 
-        # these three lines below are the part that caused your error in the streamlit version —
-        # we now copy your original script's behavior: str(...).zfill(4) instead of int(...)
         stquick_val = group["STQuickRating"].iloc[0]
         omquick_val = group["OMQuickRating"].iloc[0]
         overall_val = group["OverallPipeRatingsIndex"].iloc[0]
 
-        str_score = (
-            str(stquick_val).zfill(4) if pd.notna(stquick_val) else "0000"
-        )
-        om_score = (
-            str(omquick_val).zfill(4) if pd.notna(omquick_val) else "0000"
-        )
+        # same as your working script: just zfill the string, don't int()
+        str_score = str(stquick_val).zfill(4) if pd.notna(stquick_val) else "0000"
+        om_score = str(omquick_val).zfill(4) if pd.notna(omquick_val) else "0000"
 
-        # length surveyed → 2 decimals like your script
-        ls = group["Length_Surveyed"].iloc[0]
-        if pd.notna(ls):
+        # Length_Surveyed to 2 decimals
+        ls_val = group["Length_Surveyed"].iloc[0]
+        if pd.notna(ls_val):
             try:
-                ls = round(float(ls), 2)
+                ls_val = round(float(ls_val), 2)
             except Exception:
-                ls = None
+                ls_val = None
         else:
-            ls = None
+            ls_val = None
 
-        # overall score → 2 decimals if numeric
+        # Overall Scores to 2 decimals if numeric
         if pd.notna(overall_val):
             try:
                 overall_fmt = round(float(overall_val), 2)
@@ -146,11 +147,11 @@ def process_files(conditions_xl, inspections_xl, ratings_xl, unwanted_codes: set
 
         row = {
             "InspectionID": insp_id,
-            "Pipe_Segment_Reference": seg_ref,
+            "Pipe_Segment_Reference": psr,
             "Inspection_Date": group["Inspection_Date"].iloc[0],
             "Street": group["Street"].iloc[0],
             "City": group["City"].iloc[0],
-            "Length_Surveyed": ls,
+            "Length_Surveyed": ls_val,
             "Diameter": group["Height"].iloc[0],
             "Material": group["Material"].iloc[0],
             "Upstream_MH": group["Upstream_MH"].iloc[0],
@@ -160,47 +161,45 @@ def process_files(conditions_xl, inspections_xl, ratings_xl, unwanted_codes: set
             "Overall Scores": overall_fmt,
         }
 
-        # add PACP_Code1..N
+        # add PACP_Code1..N columns
         for i, code in enumerate(codes, start=1):
             row[f"PACP_Code{i}"] = code
 
-        rows.append(row)
+        out_rows.append(row)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(out_rows)
 
-# ===================== Streamlit UI =====================
+# =================== STREAMLIT UI ===================
 
-st.title("PACP Coder 2.0 — Streamlit (same output as script)")
+st.title("PACP Coder 2.0 — streamlit (fixed non-continuous counts)")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    conditions_file = st.file_uploader("1) PACP_Conditions", type=["xlsx", "xls"])
-with col2:
-    inspections_file = st.file_uploader("2) PACP_Inspections", type=["xlsx", "xls"])
-with col3:
-    ratings_file = st.file_uploader("3) PACP_Ratings", type=["xlsx", "xls"])
+c1, c2, c3 = st.columns(3)
+with c1:
+    f_cond = st.file_uploader("1) PACP_Conditions", type=["xlsx", "xls"])
+with c2:
+    f_insp = st.file_uploader("2) PACP_Inspections", type=["xlsx", "xls"])
+with c3:
+    f_rate = st.file_uploader("3) PACP_Ratings", type=["xlsx", "xls"])
 
 st.markdown("### 2) Options")
 st.write("**Unwanted PACP codes (comma/space separated)**")
 unwanted_text = st.text_area(
-    "Edit or add to this list:",
+    "Edit/add/remove:",
     value=DEFAULT_UNWANTED_STR,
     height=100,
 )
 
-run_btn = st.button("Process")
+run = st.button("Process")
 
-if run_btn:
-    if not (conditions_file and inspections_file and ratings_file):
-        st.error("Please upload all three PACP Excel files.")
+if run:
+    if not (f_cond and f_insp and f_rate):
+        st.error("Please upload all 3 files.")
         st.stop()
 
     unwanted_set = parse_unwanted(unwanted_text)
 
     try:
-        df_out = process_files(
-            conditions_file, inspections_file, ratings_file, unwanted_set
-        )
+        df_out = process_files(f_cond, f_insp, f_rate, unwanted_set)
     except Exception as e:
         st.exception(e)
         st.stop()
@@ -209,14 +208,14 @@ if run_btn:
     st.dataframe(df_out, use_container_width=True)
 
     # download
-    bio = io.BytesIO()
-    df_out.to_excel(bio, index=False, sheet_name="PACP_Output")
-    bio.seek(0)
+    buf = io.BytesIO()
+    df_out.to_excel(buf, index=False, sheet_name="PACP_Output")
+    buf.seek(0)
     st.download_button(
         "Download PACP_Output.xlsx",
-        data=bio,
+        data=buf,
         file_name="PACP_Output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("Upload the 3 files and click **Process**.")
+    st.info("Upload files, adjust unwanted codes, then click **Process**.")
